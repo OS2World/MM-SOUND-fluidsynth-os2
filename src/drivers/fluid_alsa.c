@@ -355,6 +355,7 @@ void delete_fluid_alsa_audio_driver(fluid_audio_driver_t *p)
     if(dev->thread)
     {
         fluid_thread_join(dev->thread);
+        delete_fluid_thread(dev->thread);
     }
 
     if(dev->pcm)
@@ -757,6 +758,7 @@ delete_fluid_alsa_rawmidi_driver(fluid_midi_driver_t *p)
     if(dev->thread)
     {
         fluid_thread_join(dev->thread);
+        delete_fluid_thread(dev->thread);
     }
 
     if(dev->rawmidi_in)
@@ -1139,7 +1141,7 @@ new_fluid_alsa_seq_driver(fluid_settings_t *settings,
     }
 
     /* tell the lash server our client id */
-#ifdef LASH_ENABLED
+#ifdef HAVE_LASH
     {
         int enable_lash = 0;
         fluid_settings_getint(settings, "lash.enable", &enable_lash);
@@ -1149,7 +1151,7 @@ new_fluid_alsa_seq_driver(fluid_settings_t *settings,
             fluid_lash_alsa_client_id(fluid_lash_client, snd_seq_client_id(dev->seq_handle));
         }
     }
-#endif /* LASH_ENABLED */
+#endif /* HAVE_LASH */
 
     fluid_atomic_int_set(&dev->should_quit, 0);
 
@@ -1210,6 +1212,7 @@ delete_fluid_alsa_seq_driver(fluid_midi_driver_t *p)
     if(dev->thread)
     {
         fluid_thread_join(dev->thread);
+        delete_fluid_thread(dev->thread);
     }
 
     if(dev->seq_handle)

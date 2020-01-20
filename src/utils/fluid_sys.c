@@ -79,9 +79,6 @@ struct _fluid_server_socket_t
 
 static int fluid_istream_gets(fluid_istream_t in, char *buf, int len);
 
-
-static char fluid_errbuf[512];  /* buffer for error message */
-
 static fluid_log_function_t fluid_log_function[LAST_LOG_LEVEL] =
 {
     fluid_default_log_function,
@@ -175,24 +172,58 @@ fluid_default_log_function(int level, const char *message, void *data)
 int
 fluid_log(int level, const char *fmt, ...)
 {
-    fluid_log_function_t fun = NULL;
-
-    va_list args;
-    va_start(args, fmt);
-    FLUID_VSNPRINTF(fluid_errbuf, sizeof(fluid_errbuf), fmt, args);
-    va_end(args);
-
     if((level >= 0) && (level < LAST_LOG_LEVEL))
     {
-        fun = fluid_log_function[level];
+        fluid_log_function_t fun = fluid_log_function[level];
 
         if(fun != NULL)
         {
-            (*fun)(level, fluid_errbuf, fluid_log_user_data[level]);
+            char errbuf[1024];
+            
+            va_list args;
+            va_start(args, fmt);
+            FLUID_VSNPRINTF(errbuf, sizeof(errbuf), fmt, args);
+            va_end(args);
+        
+            (*fun)(level, errbuf, fluid_log_user_data[level]);
         }
     }
 
     return FLUID_FAILED;
+}
+
+void* fluid_alloc(size_t len)
+{
+    void* ptr = malloc(len);
+
+#if defined(DEBUG) && !defined(_MSC_VER)
+    // garbage initialize allocated memory for debug builds to ease reproducing
+    // bugs like 44453ff23281b3318abbe432fda90888c373022b .
+    //
+    // MSVC++ already garbage initializes allocated memory by itself (debug-heap).
+    //
+    // 0xCC because
+    // * it makes pointers reliably crash when dereferencing them,
+    // * floating points are still some valid but insanely huge negative number, and
+    // * if for whatever reason this allocated memory is executed, it'll trigger
+    //   INT3 (...at least on x86)
+    if(ptr != NULL)
+    {
+        memset(ptr, 0xCC, len);
+    }
+#endif
+    return ptr;
+}
+
+/**
+ * Convenience wrapper for free() that satisfies at least C90 requirements.
+ * Especially useful when using fluidsynth with programming languages that do not provide malloc() and free().
+ * @note Only use this function when the API documentation explicitly says so. Otherwise use adequate \c delete_fluid_* functions.
+ * @since 2.0.7
+ */
+void fluid_free(void* ptr)
+{
+    free(ptr);
 }
 
 /**
@@ -271,15 +302,6 @@ char *fluid_strtok(char **str, char *delim)
     return token;
 }
 
-/*
- * fluid_error
- */
-char *
-fluid_error()
-{
-    return fluid_errbuf;
-}
-
 /**
  * Suspend the execution of the current thread for the specified amount of time.
  * @param milliseconds to wait.
@@ -291,22 +313,21 @@ void fluid_msleep(unsigned int msecs)
 
 /**
  * Get time in milliseconds to be used in relative timing operations.
- * @return Unix time in milliseconds.
+ * @return Monotonic time in milliseconds.
  */
 unsigned int fluid_curtime(void)
 {
-    static glong initial_seconds = 0;
-    GTimeVal timeval;
+    float now;
+    static float initial_time = 0;
 
-    if(initial_seconds == 0)
+    if(initial_time == 0)
     {
-        g_get_current_time(&timeval);
-        initial_seconds = timeval.tv_sec;
+        initial_time = (float)fluid_utime();
     }
 
-    g_get_current_time(&timeval);
+    now = (float)fluid_utime();
 
-    return (unsigned int)((timeval.tv_sec - initial_seconds) * 1000.0 + timeval.tv_usec / 1000.0);
+    return (unsigned int)((now - initial_time) / 1000.0f);
 }
 
 /**
@@ -945,7 +966,7 @@ fluid_thread_t *
 new_fluid_thread(const char *name, fluid_thread_func_t func, void *data, int prio_level, int detach)
 {
     GThread *thread;
-    fluid_thread_info_t *info;
+    fluid_thread_info_t *info = NULL;
     GError *err = NULL;
 
     g_return_val_if_fail(func != NULL, NULL);
@@ -982,25 +1003,21 @@ new_fluid_thread(const char *name, fluid_thread_func_t func, void *data, int pri
 #endif
     }
 
+    else
+    {
 #if NEW_GLIB_THREAD_API
-    else
-    {
         thread = g_thread_try_new(name, (GThreadFunc)func, data, &err);
-    }
-
 #else
-    else
-    {
         thread = g_thread_create((GThreadFunc)func, data, detach == FALSE, &err);
-    }
-
 #endif
+    }
 
     if(!thread)
     {
         FLUID_LOG(FLUID_ERR, "Failed to create the thread: %s",
                   fluid_gerror_message(err));
         g_clear_error(&err);
+        FLUID_FREE(info);
         return NULL;
     }
 
@@ -1267,6 +1284,9 @@ fluid_istream_gets(fluid_istream_t in, char *buf, int len)
         /* Handle read differently depending on if its a socket or file descriptor */
         if(!(in & FLUID_SOCKET_FLAG))
         {
+            // usually read() is supposed to return '\n' as last valid character of the user input
+            // when compiled with compatibility for WinXP however, read() may return 0 (EOF) rather than '\n'
+            // this would cause the shell to exit early
             n = read(in, &c, 1);
 
             if(n == -1)
@@ -1290,7 +1310,8 @@ fluid_istream_gets(fluid_istream_t in, char *buf, int len)
         if(n == 0)
         {
             *buf = 0;
-            return 0;
+            // return 1 if read from stdin, else 0, to fix early exit of shell
+            return (in == STDIN_FILENO);
         }
 
         if(c == '\n')
@@ -1460,7 +1481,7 @@ static fluid_thread_return_t fluid_server_socket_run(void *data)
         {
             if(server_socket->cont)
             {
-                FLUID_LOG(FLUID_ERR, "Failed to accept connection: %ld", fluid_socket_get_error());
+                FLUID_LOG(FLUID_ERR, "Failed to accept connection: %d", fluid_socket_get_error());
             }
 
             server_socket->cont = 0;
@@ -1519,7 +1540,7 @@ new_fluid_server_socket(int port, fluid_server_func_t func, void *data)
 
     if(sock == INVALID_SOCKET)
     {
-        FLUID_LOG(FLUID_ERR, "Failed to create server socket: %ld", fluid_socket_get_error());
+        FLUID_LOG(FLUID_ERR, "Failed to create server socket: %d", fluid_socket_get_error());
         fluid_socket_cleanup();
         return NULL;
     }
@@ -1534,7 +1555,7 @@ new_fluid_server_socket(int port, fluid_server_func_t func, void *data)
 
     if(sock == INVALID_SOCKET)
     {
-        FLUID_LOG(FLUID_ERR, "Failed to create server socket: %ld", fluid_socket_get_error());
+        FLUID_LOG(FLUID_ERR, "Failed to create server socket: %d", fluid_socket_get_error());
         fluid_socket_cleanup();
         return NULL;
     }
@@ -1547,7 +1568,7 @@ new_fluid_server_socket(int port, fluid_server_func_t func, void *data)
 
     if(bind(sock, (const struct sockaddr *) &addr, sizeof(addr)) == SOCKET_ERROR)
     {
-        FLUID_LOG(FLUID_ERR, "Failed to bind server socket: %ld", fluid_socket_get_error());
+        FLUID_LOG(FLUID_ERR, "Failed to bind server socket: %d", fluid_socket_get_error());
         fluid_socket_close(sock);
         fluid_socket_cleanup();
         return NULL;
@@ -1555,7 +1576,7 @@ new_fluid_server_socket(int port, fluid_server_func_t func, void *data)
 
     if(listen(sock, SOMAXCONN) == SOCKET_ERROR)
     {
-        FLUID_LOG(FLUID_ERR, "Failed to listen on server socket: %ld", fluid_socket_get_error());
+        FLUID_LOG(FLUID_ERR, "Failed to listen on server socket: %d", fluid_socket_get_error());
         fluid_socket_close(sock);
         fluid_socket_cleanup();
         return NULL;
@@ -1614,3 +1635,36 @@ void delete_fluid_server_socket(fluid_server_socket_t *server_socket)
 }
 
 #endif // NETWORK_SUPPORT
+
+FILE* fluid_file_open(const char* path, const char** errMsg)
+{
+    static const char ErrExist[] = "File does not exist.";
+    static const char ErrRegular[] = "File is not regular, refusing to open it.";
+    static const char ErrNull[] = "File does not exists or insufficient permissions to open it.";
+    
+    FILE* handle = NULL;
+    
+    if(!g_file_test(path, G_FILE_TEST_EXISTS))
+    {
+        if(errMsg != NULL)
+        {
+            *errMsg = ErrExist;
+        }
+    }
+    else if(!g_file_test(path, G_FILE_TEST_IS_REGULAR))
+    {
+        if(errMsg != NULL)
+        {
+            *errMsg = ErrRegular;
+        }
+    }
+    else if((handle = FLUID_FOPEN(path, "rb")) == NULL)
+    {
+        if(errMsg != NULL)
+        {
+            *errMsg = ErrNull;
+        }
+    }
+    
+    return handle;
+}
