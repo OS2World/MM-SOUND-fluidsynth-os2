@@ -385,7 +385,7 @@ fluid_synth_init(void)
                          );
     fluid_mod_set_source2(&default_pan_mod, 0, 0);                 /* No second source */
     fluid_mod_set_dest(&default_pan_mod, GEN_PAN);                 /* Target: pan */
-    /* Amount: 500. The SF specs $8.4.6, p. 55 syas: "Amount = 1000
+    /* Amount: 500. The SF specs $8.4.6, p. 55 says: "Amount = 1000
        tenths of a percent". The center value (64) corresponds to 50%,
        so it follows that amount = 50% x 1000/% = 500. */
     fluid_mod_set_amount(&default_pan_mod, 500.0);
@@ -463,8 +463,10 @@ fluid_synth_init(void)
     fluid_mod_set_dest(&custom_balance_mod, GEN_CUSTOM_BALANCE);     /* Destination: stereo balance */
     /* Amount: 96 dB of attenuation (on the opposite channel) */
     fluid_mod_set_amount(&custom_balance_mod, FLUID_PEAK_ATTENUATION); /* Amount: 960 */
-    
-#ifdef LIBINSTPATCH_SUPPORT
+
+    /* libinstpatch <= 1.1.4 only supports calling init() once */
+#if defined(LIBINSTPATCH_SUPPORT) && \
+    FLUID_VERSION_CHECK(IPATCH_VERSION_MAJOR,IPATCH_VERSION_MINOR,IPATCH_VERSION_PATCH) <= FLUID_VERSION_CHECK(1,1,4)
     /* defer libinstpatch init to fluid_instpatch.c to avoid #include "libinstpatch.h" */
     fluid_instpatch_init();
 #endif
@@ -607,6 +609,7 @@ new_fluid_synth(fluid_settings_t *settings)
     char *important_channels;
     int i, nbuf, prio_level = 0;
     int with_ladspa = 0;
+    double sample_rate_min, sample_rate_max;
 
     /* initialize all the conversion tables and other stuff */
     if(fluid_atomic_int_compare_and_exchange(&fluid_synth_initialized, 0, 1))
@@ -625,6 +628,12 @@ new_fluid_synth(fluid_settings_t *settings)
 
     FLUID_MEMSET(synth, 0, sizeof(fluid_synth_t));
 
+#if defined(LIBINSTPATCH_SUPPORT) && \
+    FLUID_VERSION_CHECK(IPATCH_VERSION_MAJOR,IPATCH_VERSION_MINOR,IPATCH_VERSION_PATCH) > FLUID_VERSION_CHECK(1,1,4)
+    /* defer libinstpatch init to fluid_instpatch.c to avoid #include "libinstpatch.h" */
+    fluid_instpatch_init();
+#endif
+
     fluid_rec_mutex_init(synth->mutex);
     fluid_settings_getint(settings, "synth.threadsafe-api", &synth->use_mutex);
     synth->public_api_count = 0;
@@ -637,6 +646,7 @@ new_fluid_synth(fluid_settings_t *settings)
 
     fluid_settings_getint(settings, "synth.polyphony", &synth->polyphony);
     fluid_settings_getnum(settings, "synth.sample-rate", &synth->sample_rate);
+    fluid_settings_getnum_range(settings, "synth.sample-rate", &sample_rate_min, &sample_rate_max);
     fluid_settings_getint(settings, "synth.midi-channels", &synth->midi_channels);
     fluid_settings_getint(settings, "synth.audio-channels", &synth->audio_channels);
     fluid_settings_getint(settings, "synth.audio-groups", &synth->audio_groups);
@@ -778,7 +788,9 @@ new_fluid_synth(fluid_settings_t *settings)
     /* Allocate event queue for rvoice mixer */
     /* In an overflow situation, a new voice takes about 50 spaces in the queue! */
     synth->eventhandler = new_fluid_rvoice_eventhandler(synth->polyphony * 64,
-                          synth->polyphony, nbuf, synth->effects_channels, synth->effects_groups, synth->sample_rate, synth->cores - 1, prio_level);
+                          synth->polyphony, nbuf, synth->effects_channels, synth->effects_groups,
+                          (fluid_real_t)sample_rate_max, synth->sample_rate,
+                          synth->cores - 1, prio_level);
 
     if(synth->eventhandler == NULL)
     {
@@ -1112,6 +1124,12 @@ delete_fluid_synth(fluid_synth_t *synth)
     fluid_rec_mutex_destroy(synth->mutex);
 
     FLUID_FREE(synth);
+
+#if defined(LIBINSTPATCH_SUPPORT) && \
+    FLUID_VERSION_CHECK(IPATCH_VERSION_MAJOR,IPATCH_VERSION_MINOR,IPATCH_VERSION_PATCH) > FLUID_VERSION_CHECK(1,1,4)
+    /* defer libinstpatch deinit to fluid_instpatch.c to avoid #include "libinstpatch.h" */
+    fluid_instpatch_deinit();
+#endif
 }
 
 /**
@@ -2207,7 +2225,7 @@ fluid_synth_sysex_midi_tuning(fluid_synth_t *synth, const char *data, int len,
 }
 
 /**
- * Turn off all notes on a MIDI channel (put them into release phase).
+ * Turn off all voices that are playing on the given MIDI channel, by putting them into release phase.
  * @param synth FluidSynth instance
  * @param chan MIDI channel number (0 to MIDI channel count - 1), (chan=-1 selects all channels)
  * @return #FLUID_OK on success, #FLUID_FAILED otherwise
@@ -2257,7 +2275,7 @@ fluid_synth_all_notes_off_LOCAL(fluid_synth_t *synth, int chan)
 }
 
 /**
- * Immediately stop all notes on a MIDI channel (skips release phase).
+ * Immediately stop all voices on the given MIDI channel (skips release phase).
  * @param synth FluidSynth instance
  * @param chan MIDI channel number (0 to MIDI channel count - 1), (chan=-1 selects all channels)
  * @return #FLUID_OK on success, #FLUID_FAILED otherwise
@@ -3624,7 +3642,7 @@ fx[ ((k * fluid_synth_count_effects_channels() + j) * 2 + 1) % nfx ]  = right_bu
  * <code>0 <= j < fluid_synth_count_effects_channels()</code> is a zero-based index denoting the effect channel within
  * unit \p k.
  *
- * Any voice playing is assigned to audio channels based on the MIDI channel its playing on. Let \p chan be the
+ * Any playing voice is assigned to audio channels based on the MIDI channel it's playing on: Let \p chan be the
  * zero-based MIDI channel index an arbitrary voice is playing on. To determine the audio channel and effects unit it is
  * going to be rendered to use:
  *
@@ -4063,7 +4081,7 @@ fluid_synth_write_s16(fluid_synth_t *synth, int len,
     while(size);
 
     synth->cur = cur;
-    synth->dither_index = di;	/* keep dither buffer continous */
+    synth->dither_index = di;	/* keep dither buffer continuous */
 
     time = fluid_utime() - time;
     cpu_load = 0.5 * (fluid_atomic_float_get(&synth->cpu_load) + time * synth->sample_rate / len / 10000.0);
@@ -4114,7 +4132,7 @@ fluid_synth_dither_s16(int *dither_index, int len, const float *lin, const float
         }
     }
 
-    *dither_index = di;	/* keep dither buffer continous */
+    *dither_index = di;	/* keep dither buffer continuous */
 
     fluid_profile(FLUID_PROF_WRITE, prof_ref, 0, len);
 }
@@ -4385,6 +4403,7 @@ fluid_synth_alloc_voice(fluid_synth_t *synth, fluid_sample_t *sample,
                         int chan, int key, int vel)
 {
     fluid_return_val_if_fail(sample != NULL, NULL);
+    fluid_return_val_if_fail(sample->data != NULL, NULL);
     FLUID_API_ENTRY_CHAN(NULL);
     FLUID_API_RETURN(fluid_synth_alloc_voice_LOCAL(synth, sample, chan, key, vel, NULL));
 
@@ -4508,14 +4527,13 @@ fluid_synth_kill_by_exclusive_class_LOCAL(fluid_synth_t *synth,
     for(i = 0; i < synth->polyphony; i++)
     {
         fluid_voice_t *existing_voice = synth->voice[i];
-        int existing_excl_class = fluid_voice_gen_value(existing_voice, GEN_EXCLUSIVECLASS);
 
         /* If voice is playing, on the same channel, has same exclusive
          * class and is not part of the same noteon event (voice group), then kill it */
 
         if(fluid_voice_is_playing(existing_voice)
                 && fluid_voice_get_channel(existing_voice) == fluid_voice_get_channel(new_voice)
-                && existing_excl_class == excl_class
+                && fluid_voice_gen_value(existing_voice, GEN_EXCLUSIVECLASS) == excl_class
                 && fluid_voice_get_id(existing_voice) != fluid_voice_get_id(new_voice))
         {
             fluid_voice_kill_excl(existing_voice);
@@ -6229,7 +6247,7 @@ fluid_synth_set_gen_LOCAL(fluid_synth_t *synth, int chan, int param, float value
 }
 
 /**
- * Retrive the generator NRPN offset assigned to a MIDI channel.
+ * Retrieve the generator NRPN offset assigned to a MIDI channel.
  *
  * The value returned is in native units of the generator. By default, the offset is zero.
  * @param synth FluidSynth instance
@@ -6306,7 +6324,9 @@ fluid_synth_handle_midi_event(void *data, fluid_midi_event_t *event)
 }
 
 /**
- * Create and start voices using a preset and a MIDI note on event.
+ * Create and start voices using an arbitrary preset and a MIDI note on event.
+ *
+ * Using this function is only supported when the setting @c synth.dynamic-sample-loading is false!
  * @param synth FluidSynth instance
  * @param id Voice group ID to use (can be used with fluid_synth_stop()).
  * @param preset Preset to synthesize
@@ -6323,13 +6343,32 @@ int
 fluid_synth_start(fluid_synth_t *synth, unsigned int id, fluid_preset_t *preset,
                   int audio_chan, int chan, int key, int vel)
 {
-    int result;
+    int result, dynamic_samples;
     fluid_return_val_if_fail(preset != NULL, FLUID_FAILED);
     fluid_return_val_if_fail(key >= 0 && key <= 127, FLUID_FAILED);
     fluid_return_val_if_fail(vel >= 1 && vel <= 127, FLUID_FAILED);
     FLUID_API_ENTRY_CHAN(FLUID_FAILED);
-    synth->storeid = id;
-    result = fluid_preset_noteon(preset, synth, chan, key, vel);
+
+    fluid_settings_getint(fluid_synth_get_settings(synth), "synth.dynamic-sample-loading", &dynamic_samples);
+    if(dynamic_samples)
+    {
+        // The preset might not be currently used, thus its sample data may not be loaded.
+        // This guard is to avoid a NULL deref in rvoice_write().
+        FLUID_LOG(FLUID_ERR, "Calling fluid_synth_start() while synth.dynamic-sample-loading is enabled is not supported.");
+        // Although we would be able to select the preset (and load it's samples) we have no way to
+        // unselect the preset again in fluid_synth_stop(). Also dynamic sample loading was intended
+        // to be used only when presets have been selected on a MIDI channel.
+        // Note that even if the preset is currently selected on a channel, it could be unselected at
+        // any time. And we would end up with a NULL sample->data again, because we are not referencing
+        // the preset here. Thus failure is our only option.
+        result = FLUID_FAILED;
+    }
+    else
+    {
+        synth->storeid = id;
+        result = fluid_preset_noteon(preset, synth, chan, key, vel);
+    }
+
     FLUID_API_RETURN(result);
 }
 
@@ -6895,7 +6934,7 @@ fluid_synth_check_next_basic_channel(fluid_synth_t *synth, int basicchan, int mo
         {
             /* A value of 0 for val means all possible channels from basicchan to
             to the next basic channel -1 (if any).
-            When i reachs the next basic channel group, real_val will be
+            When i reaches the next basic channel group, real_val will be
             limited if it is possible */
             if(val == 0)
             {
@@ -7009,7 +7048,7 @@ fluid_synth_set_basic_channel_LOCAL(fluid_synth_t *synth, int basicchan, int mod
 }
 
 /**
- * Searchs a previous basic channel starting from chan.
+ * Searches a previous basic channel starting from chan.
  *
  * @param synth the synth instance.
  * @param chan starting index of the search (including chan).
@@ -7019,7 +7058,7 @@ static int fluid_synth_get_previous_basic_channel(fluid_synth_t *synth, int chan
 {
     for(; chan >= 0; chan--)
     {
-        /* searchs previous basic channel */
+        /* searches previous basic channel */
         if(synth->channel[chan]->mode &  FLUID_CHANNEL_BASIC)
         {
             /* chan is the previous basic channel */
@@ -7067,7 +7106,7 @@ int fluid_synth_get_basic_channel(fluid_synth_t *synth, int chan,
         val = synth->channel[basic_chan]->mode_val;
     }
 
-    /* returns the informations if they are requested */
+    /* returns the information if they are requested */
     if(basic_chan_out)
     {
         * basic_chan_out = basic_chan;
