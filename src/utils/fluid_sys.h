@@ -167,6 +167,9 @@ typedef gintptr  intptr_t;
  */
 #define fluid_gerror_message(err)  ((err) ? err->message : "No error details")
 
+#ifdef WIN32
+char* fluid_get_windows_error(void);
+#endif
 
 #define FLUID_INLINE              inline
 
@@ -232,6 +235,8 @@ fluid_timer_t *new_fluid_timer(int msec, fluid_timer_callback_t callback,
 void delete_fluid_timer(fluid_timer_t *timer);
 int fluid_timer_join(fluid_timer_t *timer);
 int fluid_timer_stop(fluid_timer_t *timer);
+int fluid_timer_is_running(const fluid_timer_t *timer);
+long fluid_timer_get_interval(const fluid_timer_t * timer);
 
 // Macros to use for pre-processor if statements to test which Glib thread API we have (pre or post 2.32)
 #define NEW_GLIB_THREAD_API   GLIB_CHECK_VERSION(2,32,0)
@@ -404,19 +409,19 @@ typedef GStaticPrivate fluid_private_t;
   g_atomic_pointer_compare_and_exchange(_pp, _old, _new)
 
 static FLUID_INLINE void
-fluid_atomic_float_set(volatile float *fptr, float val)
+fluid_atomic_float_set(fluid_atomic_float_t *fptr, float val)
 {
     int32_t ival;
     memcpy(&ival, &val, 4);
-    fluid_atomic_int_set((volatile int *)fptr, ival);
+    fluid_atomic_int_set((fluid_atomic_int_t *)fptr, ival);
 }
 
 static FLUID_INLINE float
-fluid_atomic_float_get(volatile float *fptr)
+fluid_atomic_float_get(fluid_atomic_float_t *fptr)
 {
     int32_t ival;
     float fval;
-    ival = fluid_atomic_int_get((volatile int *)fptr);
+    ival = fluid_atomic_int_get((fluid_atomic_int_t *)fptr);
     memcpy(&fval, &ival, 4);
     return fval;
 }
@@ -499,6 +504,8 @@ typedef GStatBuf fluid_stat_buf_t;
 #endif
 
 FILE* fluid_file_open(const char* filename, const char** errMsg);
+fluid_long_long_t fluid_file_tell(FILE* f);
+
 
 /* Profiling */
 #if WITH_PROFILING
